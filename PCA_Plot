@@ -1,0 +1,113 @@
+############################################################
+# RNA-seq PCA Workflow (Publication-Ready)
+# Steps:
+#   1. Load count matrix from Excel
+#   2. Construct metadata (conditions, replicates)
+#   3. Create DESeq2 object and variance-stabilized data
+#   4. PCA plot with custom styling
+#   5. Save high-resolution PNG/TIFF (1200 dpi)
+#
+# Author: (your name)
+# Date: (yyyy-mm-dd)
+############################################################
+
+library(readxl)
+library(data.table)
+library(DESeq2)
+library(ggplot2)
+
+# --- 1) File path (replace with your actual repo path) ---
+xlsx_path <- "Filepath/ALL_deseq_unnormalized_counts_annotated.xlsx"
+
+# --- 2) Load data ---
+dt <- as.data.table(readxl::read_excel(xlsx_path))
+
+# Expected prefixes (adjust if needed)
+prefixes <- c("CD8a_RNA_GQI_", "CD8a_RNA_GQP_", "CD8a_RNA_PBS_", "CD8a_RNA_SDEC_")
+
+# Identify count columns
+count_cols <- grep(paste0("^(", paste0(prefixes, collapse="|"), ")[0-9]+$"), 
+                   names(dt), value = TRUE)
+
+# Identify gene ID column (fallback = first column)
+gene_col_cands <- c("Ensembl","ENSEMBL","GeneID","gene_id","gene","Gene","Row.names")
+gene_col <- gene_col_cands[match(TRUE, gene_col_cands %in% names(dt))]
+if (is.na(gene_col)) gene_col <- names(dt)[1]
+
+# --- 3) Count matrix ---
+genes <- dt[[gene_col]]
+counts_mat <- as.matrix(dt[, ..count_cols])
+rownames(counts_mat) <- make.unique(as.character(genes))
+mode(counts_mat) <- "integer"
+
+# --- 4) Metadata ---
+samples <- colnames(counts_mat)
+condition <- sub("^CD8a_RNA_([A-Za-z0-9]+)_\\d+$", "\\1", samples)   # GQI/GQP/PBS/SDEC
+replicate <- as.integer(sub("^.*_(\\d+)$", "\\1", samples))
+
+meta <- data.frame(
+  sample = samples,
+  condition = factor(condition, levels = c("PBS","GQI","GQP","SDEC")),
+  replicate = replicate,
+  row.names = samples,
+  stringsAsFactors = FALSE
+)
+
+# --- 5) DESeq2 object and VST ---
+dds <- DESeqDataSetFromMatrix(countData = counts_mat, colData = meta, design = ~ condition)
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind = FALSE)
+
+# --- 6) PCA data ---
+pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+# --- 7) PCA plot (publication-ready style) ---
+pal <- c(
+  "GQI"  = "#6A3D9A",  # purple
+  "PBS"  = "#000000",  # black
+  "GQP"  = "#1F78B4",  # blue
+  "SDEC" = "#E31A1C"   # red
+)
+
+p_pub <- ggplot(pcaData, aes(PC1, PC2, color = condition)) +
+  # quadrant reference lines (bold dashed)
+  geom_vline(xintercept = 10, color = "grey20", linewidth = 0.8, linetype = "dashed") +
+  geom_hline(yintercept = -5, color = "grey20", linewidth = 0.8, linetype = "dashed") +
+  # sample points
+  geom_point(size = 3.8, alpha = 0.95) +
+  scale_color_manual(values = pal, breaks = c("PBS","GQI","GQP","SDEC")) +
+  labs(
+    title = NULL,
+    x = paste0("PC1 (", percentVar[1], "%)"),
+    y = paste0("PC2 (", percentVar[2], "%)")
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major = element_line(color = "grey70", linetype = "dotted", linewidth = 0.3),
+    panel.grid.minor = element_line(color = "grey85", linetype = "dotted", linewidth = 0.2),
+    panel.border     = element_rect(linewidth = 0.8, color = "black"),
+    axis.line        = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
+    axis.text        = element_text(face = "bold", color = "black"),
+    axis.title       = element_text(face = "bold", color = "black"),
+    legend.text      = element_text(face = "bold", color = "black"),
+    legend.title     = element_blank(),
+    legend.key       = element_blank(),
+    legend.position  = "right",
+    plot.title       = element_text(face = "bold", hjust = 0.5, color = "black"),
+    plot.margin      = margin(6, 6, 6, 6)
+  )
+
+# --- 8) Save outputs (PNG/TIFF, 1200 dpi) ---
+outdir <- "Filepath"
+
+png(file.path(outdir, "PCA_plot_1200dpi.png"),
+    width = 6, height = 5, units = "in", res = 1200)
+print(p_pub)
+dev.off()
+
+tiff(file.path(outdir, "PCA_plot_1200dpi.tiff"),
+     width = 6, height = 5, units = "in", res = 1200, compression = "lzw")
+print(p_pub)
+dev.off()
