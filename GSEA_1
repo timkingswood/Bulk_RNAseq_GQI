@@ -1,0 +1,183 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# GSEA (Immune-focused, GO:0002376 descendants) + DEG exports
+# Author: [Your Name]
+# GitHub-ready reproducible pipeline
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+  library(clusterProfiler)
+  library(AnnotationDbi)
+  library(org.Mm.eg.db)   # Mouse; For Human replace with org.Hs.eg.db
+  library(GO.db)
+  library(here)           # Path management
+})
+
+# ---- User Parameters ----
+comparison_title <- "GQI vs SDEC"      # plot title
+de_path <- here("data", "GQI_vs_SDEC_deseq_diff_expression_annotated_flipped.xlsx")
+outdir  <- here("results", "GQI_vs_SDEC")
+
+alpha        <- 0.05     # padj cutoff
+lfc_thr      <- 1        # |log2FC| cutoff
+base_mean_min <- 10      # filter: baseMean > 10
+top_n_each   <- 12       # top terms per direction
+organism     <- "Mm"     # "Mm" (mouse) / "Hs" (human)
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Load DESeq2 table ----
+sheets <- readxl::excel_sheets(de_path)
+sheet_to_use <- if ("in" %in% sheets) "in" else sheets[1]
+df <- readxl::read_excel(de_path, sheet = sheet_to_use)
+names(df) <- gsub(" ", "_", names(df))
+
+# ---- Column mapping ----
+col_stat <- intersect(c("stat","Wald_Statistic"), names(df))[1]
+col_lfc  <- intersect(c("log2FoldChange","Log2_Fold_Change"), names(df))[1]
+col_padj <- intersect(c("padj","FDR_Adj_p_Value"), names(df))[1]
+col_base <- intersect(c("baseMean","Mean"), names(df))[1]
+col_sym  <- intersect(c("SYMBOL","Gene_Symbol"), names(df))[1]
+col_ens  <- intersect(c("Ensembl_ID","ENSEMBL","Ensembl"), names(df))[1]
+
+if (is.na(col_stat)) stop("DE table must include 'stat' or 'Wald_Statistic'")
+if (is.na(col_sym) && is.na(col_ens)) stop("Need SYMBOL or Ensembl ID column")
+
+num_to_numeric <- function(x) suppressWarnings(as.numeric(x))
+df[[col_stat]] <- num_to_numeric(df[[col_stat]])
+if (!is.na(col_lfc))  df[[col_lfc]]  <- num_to_numeric(df[[col_lfc]])
+if (!is.na(col_padj)) df[[col_padj]] <- num_to_numeric(df[[col_padj]])
+if (!is.na(col_base)) df[[col_base]] <- num_to_numeric(df[[col_base]])
+
+# ---- Filter baseMean ----
+if (!is.na(col_base)) {
+  df <- df %>% filter(!is.na(.data[[col_base]]), .data[[col_base]] > base_mean_min)
+}
+
+# ---- SYMBOL_SAFE ----
+df <- df %>%
+  mutate(SYMBOL_SAFE = dplyr::coalesce(
+    if (!is.na(col_sym)) .data[[col_sym]] else NULL,
+    if (!is.na(col_ens)) .data[[col_ens]] else NULL))
+
+# ---- ID mapping SYMBOL → ENTREZ ----
+OrgDb_obj <- if (organism == "Mm") org.Mm.eg.db else org.Hs.eg.db
+
+map <- suppressMessages(
+  AnnotationDbi::select(OrgDb_obj,
+                        keys = na.omit(unique(df$SYMBOL_SAFE)),
+                        keytype = "SYMBOL",
+                        columns = c("ENTREZID","SYMBOL"))
+) %>% filter(!is.na(ENTREZID)) %>% distinct(SYMBOL, .keep_all = TRUE)
+
+rank_df <- df %>%
+  filter(!is.na(.data[[col_stat]])) %>%
+  distinct(SYMBOL_SAFE, .keep_all = TRUE) %>%
+  inner_join(map, by = c("SYMBOL_SAFE" = "SYMBOL"))
+
+geneList <- rank_df[[col_stat]]
+names(geneList) <- rank_df$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# ---- Run gseGO (BP) ----
+ego <- clusterProfiler::gseGO(
+  geneList      = geneList,
+  OrgDb         = OrgDb_obj,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  minGSSize     = 10,
+  maxGSSize     = 500,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+ego_df_all <- as.data.frame(ego)
+if (nrow(ego_df_all) == 0) stop("No GSEA results found")
+
+# ---- Immune (GO:0002376 descendants) ----
+immune_root <- "GO:0002376"
+bp_offspring <- AnnotationDbi::as.list(GOBPOFFSPRING)
+immune_desc  <- unique(c(immune_root, bp_offspring[[immune_root]]))
+ego_df <- ego_df_all %>% filter(ID %in% immune_desc)
+if (nrow(ego_df) == 0) stop("No immune-related GSEA results")
+
+# ---- Export DEGs ----
+if (!is.na(col_padj) && !is.na(col_lfc)) {
+  deg_only <- df %>%
+    filter(!is.na(.data[[col_padj]]),
+           !is.na(.data[[col_lfc]]),
+           .data[[col_padj]] < alpha,
+           abs(.data[[col_lfc]]) > lfc_thr) %>%
+    mutate(Direction = ifelse(.data[[col_lfc]] > 0, "Up", "Down"),
+           SYMBOL_EXPORT = dplyr::coalesce(
+             if (!is.na(col_sym)) .data[[col_sym]] else NULL,
+             if (!is.na(col_ens)) .data[[col_ens]] else NULL)) %>%
+    arrange(desc(Direction), .data[[col_padj]])
+
+  keep_cols <- c(if (!is.na(col_ens)) col_ens else NULL,
+                 "SYMBOL_EXPORT",
+                 if (!is.na(col_lfc)) col_lfc else NULL,
+                 if (!is.na(col_stat)) col_stat else NULL,
+                 if (!is.na(col_padj)) col_padj else NULL,
+                 if (!is.na(col_base)) col_base else NULL,
+                 "Direction")
+
+  deg_out <- deg_only[, keep_cols[keep_cols %in% names(deg_only)], drop = FALSE]
+
+  write.csv(deg_out, file.path(outdir, "DEG_padj05_LFC1_all.csv"), row.names = FALSE)
+  write.csv(filter(deg_out, Direction == "Up"),
+            file.path(outdir, "DEG_padj05_LFC1_up.csv"), row.names = FALSE)
+  write.csv(filter(deg_out, Direction == "Down"),
+            file.path(outdir, "DEG_padj05_LFC1_down.csv"), row.names = FALSE)
+}
+
+# ---- Signed NES plot ----
+ego_df <- ego_df %>%
+  mutate(negLog10Padj = -log10(p.adjust),
+         Direction    = ifelse(NES >= 0, "Up", "Down"))
+
+plot_df <- bind_rows(
+  ego_df %>% filter(NES > 0) %>% arrange(p.adjust, desc(NES)) %>% head(top_n_each),
+  ego_df %>% filter(NES < 0) %>% arrange(p.adjust, NES)       %>% head(top_n_each)
+) %>%
+  arrange(NES) %>%
+  mutate(Label = str_wrap(Description, width = 42),
+         Label = factor(Label, levels = unique(Label)))
+
+xlim_max <- max(abs(plot_df$NES), na.rm = TRUE) * 1.1
+grad_cols <- c("#4575b4", "#7b6fb3", "#d73027")
+
+p <- ggplot(plot_df, aes(y = Label, x = NES)) +
+  geom_col(aes(fill = negLog10Padj), width = 0.75, color = "grey15", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.45, alpha = 0.7) +
+  scale_fill_gradientn(
+    colours = grad_cols,
+    name = expression(-log[10]~"(padj)"),
+    limits = c(0, max(plot_df$negLog10Padj, na.rm = TRUE)),
+    oob = squish
+  ) +
+  scale_x_continuous(limits = c(-xlim_max, xlim_max)) +
+  labs(
+    title    = paste0("GSEA — Immune System Process (GO:0002376 descendants)\nComparison: ", comparison_title),
+    subtitle = "Signed NES: + Up, − Down | Fill = −log10(padj)",
+    x = "NES (Normalized Enrichment Score)", y = NULL
+  ) +
+  theme_classic(base_size = 10.5) +
+  theme(
+    legend.position   = "top",
+    axis.text.y       = element_text(size = 9, face = "bold"),
+    axis.text.x       = element_text(size = 9, face = "bold"),
+    axis.title.x      = element_text(face = "bold")
+  )
+
+h <- 0.32 * nrow(plot_df) + 1.5
+ggsave(file.path(outdir, "GSEA_GO_immune_signed_bar.png"),
+       p, width = 6.0, height = h, dpi = 500)
+ggsave(file.path(outdir, "GSEA_GO_immune_signed_bar.pdf"),
+       p, width = 6.0, height = h, device = cairo_pdf)
