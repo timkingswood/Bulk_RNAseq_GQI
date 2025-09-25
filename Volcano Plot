@@ -1,0 +1,159 @@
+
+---
+
+# scripts/degs_volcano_export.R
+
+```r
+# ================================
+# RNAseq_Tanner: DEG Export + Volcano Plot
+# - No re-filter / No re-calc (use Excel padj as-is)
+# - Exports:
+#   1) padj-only
+#   2) padj + |log2FC| cutoff
+#   3) from Significant column (if present)
+#   4) Single combined CSV with Direction (padj + |log2FC|)
+# - Saves volcano plot (PNG/PDF)
+# ================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(ggplot2)
+})
+
+# -------- Parameters (edit here) --------
+alpha    <- 0.05   # FDR cutoff
+lfc_thr  <- 1      # |log2FC| cutoff
+pt_size  <- 2.0
+pt_alpha <- 0.7
+
+# Default input files (used if no CLI args are given)
+default_paths <- c(
+  "C:/Users/young/Desktop/RNAseq_Tanner/GQI_vs_GQP_deseq_diff_expression_annotated.xlsx",
+  "C:/Users/young/Desktop/RNAseq_Tanner/GQI_vs_SDEC_deseq_diff_expression_annotated.xlsx"
+)
+
+# Get paths from command line args (or fall back to defaults)
+args <- commandArgs(trailingOnly = TRUE)
+paths <- if (length(args) > 0) args else default_paths
+
+# ----------------------------------------
+
+process_contrast <- function(path, alpha = 0.05, lfc_thr = 1, pt_size = 2, pt_alpha = 0.7) {
+  if (!file.exists(path)) {
+    stop("File not found: ", path)
+  }
+  message("\n=== Processing: ", path, " ===")
+
+  out_dir <- normalizePath(dirname(path), winslash = "/")
+  base    <- tools::file_path_sans_ext(basename(path)) # e.g., GQI_vs_GQP_deseq_diff_expression_annotated
+  prefix  <- gsub("_deseq_diff_expression_annotated$", "", base)  # e.g., GQI_vs_GQP
+
+  # ---- Load ----
+  df <- read_excel(path, sheet = "in")
+
+  # Ensure numeric, and fallback SYMBOL
+  df <- df %>%
+    mutate(
+      padj           = suppressWarnings(as.numeric(padj)),
+      log2FoldChange = suppressWarnings(as.numeric(log2FoldChange)),
+      SYMBOL         = ifelse(is.na(SYMBOL) | SYMBOL == "", Ensembl_ID, SYMBOL)
+    )
+
+  # ---- Counts ----
+  n_padj_only <- sum(df$padj < alpha, na.rm = TRUE)
+  n_padj_lfc  <- sum(df$padj < alpha & abs(df$log2FoldChange) > lfc_thr, na.rm = TRUE)
+  n_padj_only_LFC_NA <- sum(df$padj < alpha & is.na(df$log2FoldChange), na.rm = TRUE)
+
+  cat(sprintf("[padj<%.2g]            : %d genes\n", alpha, n_padj_only))
+  cat(sprintf("[padj<%.2g & |LFC|>%.1f]: %d genes\n", alpha, lfc_thr, n_padj_lfc))
+  cat(sprintf("Among padj<%.2g, with LFC==NA: %d (drop out in padj+LFC)\n", alpha, n_padj_only_LFC_NA))
+
+  has_sig_col <- "Significant" %in% names(df)
+  if (has_sig_col) {
+    sig_vals <- tolower(as.character(df$Significant))
+    is_sig <- sig_vals %in% c("yes","true","y","1")
+    n_sigcol <- sum(is_sig, na.rm = TRUE)
+    cat(sprintf("[Excel 'Significant'==Yes]: %d genes\n", n_sigcol))
+  }
+
+  # ---- Exports (CSV) ----
+  out1 <- file.path(out_dir, paste0(prefix, "_DEG_padjOnly.csv"))
+  out2 <- file.path(out_dir, paste0(prefix, "_DEG_padj05_LFC", lfc_thr, ".csv"))
+  out3 <- file.path(out_dir, paste0(prefix, "_DEG_fromSignificantColumn.csv"))
+  out4 <- file.path(out_dir, paste0(prefix, "_DEG_padj05_LFC", lfc_thr, "_withDirection.csv"))
+
+  # 1) padj-only
+  deg_padj_only <- df %>% filter(padj < alpha)
+  write.csv(deg_padj_only, out1, row.names = FALSE)
+
+  # 2) padj + |LFC|
+  deg_padj_lfc <- df %>% filter(padj < alpha, abs(log2FoldChange) > lfc_thr)
+  write.csv(deg_padj_lfc, out2, row.names = FALSE)
+
+  # 3) From Significant column (optional)
+  if (has_sig_col) {
+    deg_sigcol <- df %>% filter(tolower(as.character(Significant)) %in% c("yes","true","y","1"))
+    write.csv(deg_sigcol, out3, row.names = FALSE)
+  }
+
+  # 4) Single combined CSV with Direction (padj + |LFC|)
+  deg_one <- df %>%
+    filter(!is.na(padj), !is.na(log2FoldChange),
+           padj < alpha, abs(log2FoldChange) > lfc_thr) %>%
+    mutate(Direction = ifelse(log2FoldChange > 0, "Up", "Down")) %>%
+    arrange(desc(Direction), padj)
+  write.csv(deg_one, out4, row.names = FALSE)
+
+  cat("Saved CSVs to: ", out_dir, "\n",
+      " - ", basename(out1), "\n",
+      " - ", basename(out2), "\n",
+      if (has_sig_col) paste0(" - ", basename(out3), "\n") else "",
+      " - ", basename(out4), "\n", sep = "")
+
+  # ---- Volcano Plot ----
+  vol <- df %>%
+    filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+    mutate(
+      minusLog10Padj = -log10(padj),
+      DEG = case_when(
+        padj < alpha & log2FoldChange >  lfc_thr ~ "Up",
+        padj < alpha & log2FoldChange < -lfc_thr ~ "Down",
+        TRUE ~ "Not Sig"
+      )
+    )
+
+  contrast_lab <- gsub("^(.+)_vs_(.+)$", "\\1 vs \\2", prefix)
+
+  p <- ggplot(vol, aes(x = log2FoldChange, y = minusLog10Padj)) +
+    geom_point(aes(color = DEG), alpha = pt_alpha, size = pt_size) +
+    geom_hline(yintercept = -log10(alpha), linetype = "dashed", linewidth = 0.4) +
+    geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed", linewidth = 0.4) +
+    scale_color_manual(values = c("Down"="steelblue", "Not Sig"="grey70", "Up"="firebrick")) +
+    labs(
+      title = paste0("Volcano Plot: ", contrast_lab),
+      x = paste0("log2 Fold Change (", contrast_lab, ")"),
+      y = expression(-log[10]~"(adjusted p-value)"),
+      color = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "top",
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  png_path <- file.path(out_dir, paste0("volcano_", prefix, ".png"))
+  pdf_path <- file.path(out_dir, paste0("volcano_", prefix, ".pdf"))
+
+  ggsave(png_path, p, width = 5, height = 4, dpi = 500)
+  ggsave(pdf_path, p, width = 5, height = 4, useDingbats = FALSE)
+
+  cat("Saved volcano plots:\n - ", png_path, "\n - ", pdf_path, "\n", sep = "")
+}
+
+# ---------- Run for each path ----------
+invisible(lapply(paths, function(p) process_contrast(
+  path = p,
+  alpha = alpha,
+  lfc_thr = lfc_thr,
+  pt_size = pt_size,
+  pt_alpha = pt_alpha
+)))
