@@ -1,0 +1,254 @@
+# R/heatmap_replicate_avg_GOimmune.R
+# ------------------------------------------------------------
+# Replicate-averaged heatmap (DESeq2 normalized counts) with
+# GO-based immunology filter: "immune system process" (GO:0002376)
+# - averages replicates by group
+# - filters low expression
+# - selects top-variable genes (optional)
+# - row z-score + capping
+# - auto-map columns to PBS/GQI/GQP/SDEC (prefix-safe)
+# - horizontal + bold column labels
+# - outputs PNG (600 dpi) + PDF + CSV
+# ------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(pheatmap)
+  library(RColorBrewer)
+  # Bioconductor (install once if needed):
+  # install.packages("BiocManager")
+  # BiocManager::install(c("AnnotationDbi","org.Mm.eg.db","GO.db"))
+  library(AnnotationDbi)
+  library(org.Mm.eg.db)  # Mouse
+  library(GO.db)
+})
+
+# -------- Paths & Params (relative paths for GitHub repo) --------
+in_path  <- "data/ALL_deseq_normalized_counts_annotated.xlsx"
+out_dir  <- "output"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+plot_title <- "Replicate-averaged Heatmap (row z-score) – Immune (GO:0002376)"
+
+# Filtering/tuning
+min_avg_per_group <- 20    # group-mean threshold on normalized counts
+min_groups_pass   <- 1     # require >= this many groups to exceed threshold
+top_var_genes     <- 500   # top N by variance; set NULL to keep all
+cap_z             <- 3     # clamp z-scores to [-cap_z, cap_z]
+cluster_cols_flag <- TRUE  # set FALSE to keep order PBS->GQI->GQP->SDEC
+
+# GO immunology filter
+go_root              <- "GO:0002376" # immune system process
+go_include_offspring <- TRUE         # include all child terms under GO:0002376 (BP)
+
+# -------- Helpers --------
+is_count_like <- function(nm, x) is.numeric(x) && str_detect(nm, "(.*?)[-_]?(\\d+)$")
+
+row_z <- function(x) {
+  mu  <- rowMeans(x, na.rm = TRUE)
+  sdv <- apply(x, 1, sd, na.rm = TRUE)
+  z   <- sweep(sweep(x, 1, mu, "-"), 1, sdv, "/")
+  z[is.infinite(z)] <- NA
+  z
+}
+
+# -------- 1) Read --------
+if (!file.exists(in_path)) {
+  stop(sprintf("Input not found: %s (place the file under data/)", in_path))
+}
+df_raw <- read_excel(in_path)
+
+# -------- 2) Detect count columns --------
+num_mask <- vapply(names(df_raw), function(nm) is_count_like(nm, df_raw[[nm]]), logical(1))
+num_cols <- names(df_raw)[num_mask]
+
+if (length(num_cols) == 0) {
+  stat_cols <- c("baseMean","log2FoldChange","lfcSE","stat","pvalue","padj")
+  all_numeric <- names(df_raw)[vapply(df_raw, is.numeric, logical(1))]
+  num_cols <- setdiff(all_numeric, intersect(all_numeric, stat_cols))
+}
+if (length(num_cols) == 0) stop("No numeric count-like columns found.")
+
+# -------- 3) Identify id/symbol columns --------
+id_col_candidates  <- c("gene_id","GeneID","Ensembl","ensembl","ensembl_gene_id","id")
+sym_col_candidates <- c("gene_symbol","GeneSymbol","symbol","SYMBOL","gene_name","GeneName")
+id_hits  <- intersect(id_col_candidates,  names(df_raw))
+sym_hits <- intersect(sym_col_candidates, names(df_raw))
+id_col  <- if (length(id_hits))  id_hits[1]  else NA_character_
+sym_col <- if (length(sym_hits)) sym_hits[1] else NA_character_
+if (is.na(id_col)) {
+  non_count_cols <- setdiff(names(df_raw), num_cols)
+  if (length(non_count_cols) == 0) stop("No identifier column found.")
+  id_col <- non_count_cols[1]
+}
+if (is.na(sym_col)) sym_col <- id_col
+
+df <- df_raw %>%
+  mutate(
+    !!id_col  := as.character(.data[[id_col]]),
+    !!sym_col := as.character(.data[[sym_col]])
+  ) %>%
+  dplyr::select(all_of(c(id_col, sym_col)), all_of(num_cols))
+
+# -------- 4) Parse group/rep from sample names --------
+parse_sample <- function(nm) {
+  grp <- str_replace(nm, "([_-]?\\d+)$", "")
+  if (identical(grp, nm)) grp <- sub("(\\d+)$", "", nm)
+  repn <- str_match(nm, "(\\d+)$")[, 2]
+  tibble(sample = nm, group = grp, rep = repn)
+}
+meta <- dplyr::bind_rows(lapply(num_cols, parse_sample))
+meta$group[is.na(meta$group) | meta$group == ""] <- meta$sample[is.na(meta$group) | meta$group == ""]
+
+# -------- 5) Long -> group means (wide) --------
+long <- df %>%
+  pivot_longer(cols = all_of(num_cols), names_to = "sample", values_to = "count") %>%
+  left_join(meta, by = "sample")
+
+avg_by_group <- long %>%
+  group_by(.data[[id_col]], .data[[sym_col]], group) %>%
+  summarise(avg = mean(count, na.rm = TRUE), .groups = "drop")
+
+mat_group <- avg_by_group %>%
+  pivot_wider(names_from = group, values_from = avg)
+
+# -------- 6) GO-based immunology subset (SYMBOL-level) --------
+# Build GO term set: root +/- offspring (BP)  **use [[ ]] to extract vector**
+go_set <- go_root
+if (isTRUE(go_include_offspring)) {
+  bp_kids <- GOBPOFFSPRING[[go_root]]
+  if (is.null(bp_kids)) bp_kids <- character(0)
+  go_set <- unique(c(go_root, bp_kids))
+}
+
+# Map SYMBOL -> ENTREZ
+syms <- unique(mat_group[[sym_col]])
+map1 <- AnnotationDbi::select(org.Mm.eg.db,
+                              keys = syms, keytype = "SYMBOL",
+                              columns = c("ENTREZID"))
+map1 <- map1[!is.na(map1$ENTREZID), , drop = FALSE]
+
+# Map ENTREZ -> GO
+map2 <- AnnotationDbi::select(org.Mm.eg.db,
+                              keys = unique(map1$ENTREZID), keytype = "ENTREZID",
+                              columns = c("GO","ONTOLOGY"))
+map2 <- map2[!is.na(map2$GO), , drop = FALSE]
+
+# Keep genes annotated to GO root or offspring
+immune_entrez <- unique(map2$ENTREZID[map2$GO %in% go_set])
+immune_syms   <- unique(map1$SYMBOL[match(immune_entrez, map1$ENTREZID)])
+
+if (length(immune_syms) == 0) {
+  stop("No genes matched GO:0002376 immune system process (incl. offspring) in the current table.")
+}
+
+# Filter to immune symbols
+mat_group <- mat_group %>%
+  dplyr::filter(toupper(.data[[sym_col]]) %in% toupper(immune_syms))
+
+# -------- 7) Build matrix, unique rownames --------
+sym_vec <- as.character(mat_group[[sym_col]])
+id_vec  <- as.character(mat_group[[id_col]])
+rowname_vec <- sym_vec
+dup_mask <- duplicated(sym_vec) | duplicated(sym_vec, fromLast = TRUE)
+rowname_vec[dup_mask] <- paste0(sym_vec[dup_mask], " (", id_vec[dup_mask], ")")
+
+grp_cols <- setdiff(names(mat_group), c(id_col, sym_col))
+m <- as.matrix(mat_group[, grp_cols])
+rownames(m) <- rowname_vec
+
+# -------- 8) Low-expression filter --------
+group_pass_count <- rowSums(m >= min_avg_per_group, na.rm = TRUE)
+keep_idx <- which(group_pass_count >= min_groups_pass)
+if (length(keep_idx) < 2) stop("Fewer than 2 genes left after filtering (post-GO).")
+m_kept <- m[keep_idx, , drop = FALSE]
+
+# -------- 9) Top-variable genes (optional) --------
+if (!is.null(top_var_genes) && nrow(m_kept) > top_var_genes) {
+  vars <- apply(m_kept, 1, var, na.rm = TRUE)
+  top_idx <- order(vars, decreasing = TRUE)[seq_len(top_var_genes)]
+  m_kept <- m_kept[top_idx, , drop = FALSE]
+}
+
+# -------- 10) Row z-score + cap --------
+zmat <- row_z(m_kept)
+zmat <- pmin(pmax(zmat, -cap_z), cap_z)
+
+# -------- 11) Map columns to PBS/GQI/GQP/SDEC (prefix-safe) --------
+current <- colnames(zmat)
+map_to <- vapply(current, function(nm) {
+  nm_low <- tolower(nm)
+  if (grepl("pbs",  nm_low)) "PBS"
+  else if (grepl("gqi",  nm_low)) "GQI"
+  else if (grepl("gqp",  nm_low)) "GQP"
+  else if (grepl("sdec", nm_low)) "SDEC"
+  else nm
+}, character(1))
+target_order <- c("PBS","GQI","GQP","SDEC")
+present <- intersect(target_order, unique(map_to))
+if (length(present) == 0) {
+  stop(sprintf("None of PBS/GQI/GQP/SDEC found in columns: %s",
+               paste(current, collapse = ", ")))
+}
+idx <- sapply(present, function(grp) which(map_to == grp)[1])
+zmat <- zmat[, idx, drop = FALSE]
+colnames(zmat) <- present
+
+# -------- 12) Save matrix used --------
+csv_out <- file.path(out_dir, sprintf("heatmap_input_rowZ_GOimmune_%s.csv", format(Sys.Date())))
+write.csv(
+  data.frame(gene = rownames(zmat), zmat, check.names = FALSE),
+  file = csv_out,
+  row.names = FALSE
+)
+
+# -------- 13) Plot --------
+pal <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(255)
+png_file <- file.path(out_dir, "heatmap_replicateAveraged_GOimmune.png")
+pdf_file <- file.path(out_dir, "heatmap_replicateAveraged_GOimmune.pdf")
+
+# PNG (600 dpi, 5000x4000 px)
+png(png_file, width = 5000, height = 4000, res = 600)
+pheatmap(
+  zmat,
+  color = pal,
+  cluster_rows = TRUE,
+  cluster_cols = cluster_cols_flag,
+  scale = "none",
+  border_color = NA,
+  fontsize_row = 6,
+  fontsize_col = 14,
+  show_rownames = FALSE,
+  main = plot_title,
+  angle_col = 0,
+  fontface_col = "bold"
+)
+dev.off()
+
+# PDF (vector)
+pdf(pdf_file, width = 9, height = 7)
+pheatmap(
+  zmat,
+  color = pal,
+  cluster_rows = TRUE,
+  cluster_cols = cluster_cols_flag,
+  scale = "none",
+  border_color = NA,
+  fontsize_row = 6,
+  fontsize_col = 14,
+  show_rownames = FALSE,
+  main = plot_title,
+  angle_col = 0,
+  fontface_col = "bold"
+)
+dev.off()
+
+message(sprintf(
+  "Done (GO immune). Kept genes: %d. Columns: %s.\nFiles:\n- %s\n- %s\n- %s",
+  nrow(zmat), paste(colnames(zmat), collapse = ", "),
+  png_file, pdf_file, csv_out
+))
